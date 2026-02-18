@@ -1,7 +1,7 @@
 """
 RAAM - Road Assistance & Alert Monitor
 Driver Emergency Dashboard Application
-Uses PyQt6 for UI, Groq for AI responses, and TTS with Autumn voice
+Uses PyQt6 for UI, Groq for AI responses, Whisper v3 Turbo for audio input, and TTS with Autumn voice
 """
 
 import sys
@@ -9,6 +9,9 @@ import os
 import json
 import threading
 import time
+import wave
+import struct
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -49,6 +52,14 @@ try:
 except ImportError:
     TTS_AVAILABLE = False
 
+try:
+    import sounddevice as sd
+    import numpy as np
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    print("sounddevice/numpy not installed. Run: pip install sounddevice numpy")
+
 # ─── THEME CONSTANTS ───────────────────────────────────────────────────────────
 COLORS = {
     "bg_deep":        "#0A0F1E",
@@ -66,6 +77,7 @@ COLORS = {
     "glow_amber":     "rgba(245,166,35,0.15)",
     "glow_teal":      "rgba(0,212,170,0.15)",
     "glow_red":       "rgba(232,69,69,0.2)",
+    "accent_mic":     "#B44FFF",
 }
 
 SYSTEM_PROMPT = """You are RAAM — Road Assistance & Alert Monitor. You are an AI co-pilot designed to assist drivers during emergencies, stressful situations, or when they need guidance on the road.
@@ -86,6 +98,104 @@ Your capabilities:
 - Advise when to call emergency services (911)
 
 Always start with the most critical safety information. Keep responses short when urgency is high. Use gentle, supportive language. Never panic — your calm is contagious."""
+
+
+# ─── AUDIO RECORDING THREAD ────────────────────────────────────────────────────
+class AudioRecorderThread(QThread):
+    """Records audio from microphone until stop() is called."""
+    finished = pyqtSignal(str)   # emits path to saved WAV file
+    error_occurred = pyqtSignal(str)
+
+    SAMPLE_RATE = 16000   # Whisper works best at 16kHz
+    CHANNELS = 1
+    DTYPE = "int16"
+
+    def __init__(self):
+        super().__init__()
+        self._recording = False
+        self._frames = []
+
+    def run(self):
+        if not AUDIO_AVAILABLE:
+            self.error_occurred.emit("sounddevice not installed. Run: pip install sounddevice numpy")
+            return
+
+        self._recording = True
+        self._frames = []
+
+        try:
+            with sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                blocksize=1024,
+                callback=self._callback,
+            ):
+                while self._recording:
+                    time.sleep(0.05)
+        except Exception as e:
+            self.error_occurred.emit(f"Recording error: {e}")
+            return
+
+        # Save to WAV
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(self.CHANNELS)
+                wf.setsampwidth(2)  # int16 = 2 bytes
+                wf.setframerate(self.SAMPLE_RATE)
+                import numpy as np
+                data = np.concatenate(self._frames, axis=0)
+                wf.writeframes(data.tobytes())
+
+            self.finished.emit(tmp_path)
+        except Exception as e:
+            self.error_occurred.emit(f"Save error: {e}")
+
+    def _callback(self, indata, frames, time_info, status):
+        import numpy as np
+        self._frames.append(indata.copy())
+
+    def stop(self):
+        self._recording = False
+
+
+# ─── WHISPER TRANSCRIPTION THREAD ─────────────────────────────────────────────
+class WhisperThread(QThread):
+    """Sends WAV file to Groq Whisper v3 Turbo for transcription."""
+    transcribed = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, client, wav_path: str):
+        super().__init__()
+        self.client = client
+        self.wav_path = wav_path
+
+    def run(self):
+        try:
+            with open(self.wav_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=audio_file,
+                    response_format="text",
+                    language="en",
+                )
+            # Clean up temp file
+            try:
+                os.remove(self.wav_path)
+            except Exception:
+                pass
+
+            text = transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+            if text:
+                self.transcribed.emit(text)
+            else:
+                self.error_occurred.emit("No speech detected — please try again.")
+        except Exception as e:
+            self.error_occurred.emit(f"Transcription error: {e}")
 
 
 # ─── GROQ AI THREAD ────────────────────────────────────────────────────────────
@@ -160,7 +270,6 @@ class TTSThread(QThread):
             if TTS_AVAILABLE:
                 engine = pyttsx3.init()
                 voices = engine.getProperty('voices')
-                # Try to find a female voice for Autumn-like quality
                 for voice in voices:
                     if 'female' in voice.name.lower() or 'zira' in voice.name.lower() or 'hazel' in voice.name.lower():
                         engine.setProperty('voice', voice.id)
@@ -213,51 +322,80 @@ class PulseWidget(QWidget):
         p.setBrush(QBrush(core))
         p.drawEllipse(cx - 8, cy - 8, 16, 16)
 
+    def set_color(self, hex_color: str):
+        self.color = QColor(hex_color)
 
-# ─── EMERGENCY BUTTON ──────────────────────────────────────────────────────────
-class EmergencyButton(QPushButton):
-    def __init__(self, icon_text, label, color, parent=None):
+
+# ─── MIC BUTTON ────────────────────────────────────────────────────────────────
+class MicButton(QPushButton):
+    """Pulsing microphone button that toggles recording state."""
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.icon_text = icon_text
-        self.label = label
-        self.base_color = color
-        self.setFixedSize(130, 100)
+        self.setFixedSize(46, 46)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._hover = False
+        self.setCheckable(True)
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.timeout.connect(self._pulse_tick)
+        self._pulse_phase = 0.0
+        self._is_recording = False
+        self._update_style(False)
 
+    def _update_style(self, recording: bool):
+        if recording:
+            self.setText("⏹")
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['accent_red']};
+                    border: none;
+                    border-radius: 12px;
+                    color: white;
+                    font-size: 18px;
+                }}
+                QPushButton:hover {{
+                    background: #FF5F5F;
+                }}
+            """)
+        else:
+            self.setText("🎙")
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(180,79,255,0.15);
+                    border: 1px solid {COLORS['accent_mic']};
+                    border-radius: 12px;
+                    color: {COLORS['accent_mic']};
+                    font-size: 18px;
+                }}
+                QPushButton:hover {{
+                    background: rgba(180,79,255,0.28);
+                }}
+                QPushButton:disabled {{
+                    background: rgba(255,255,255,0.04);
+                    border: 1px solid {COLORS['text_muted']};
+                    color: {COLORS['text_muted']};
+                }}
+            """)
+
+    def set_recording(self, recording: bool):
+        self._is_recording = recording
+        self._update_style(recording)
+        if recording:
+            self._pulse_timer.start(40)
+        else:
+            self._pulse_timer.stop()
+
+    def _pulse_tick(self):
+        self._pulse_phase += 0.12
+        import math
+        alpha = int(80 + 60 * abs(math.sin(self._pulse_phase)))
         self.setStyleSheet(f"""
             QPushButton {{
-                background: rgba(255,255,255,0.04);
-                border: 1px solid {COLORS['border']};
-                border-radius: 16px;
-                color: {COLORS['text_primary']};
-                font-family: 'Segoe UI';
-            }}
-            QPushButton:hover {{
-                background: rgba(255,255,255,0.08);
-                border: 1px solid {color};
-            }}
-            QPushButton:pressed {{
-                background: rgba(255,255,255,0.12);
+                background: rgba(232,69,69,{alpha/255:.2f});
+                border: 2px solid {COLORS['accent_red']};
+                border-radius: 12px;
+                color: white;
+                font-size: 18px;
             }}
         """)
-
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(6)
-
-        icon_lbl = QLabel(icon_text)
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setFont(QFont("Segoe UI Emoji", 24))
-        icon_lbl.setStyleSheet("background: transparent; border: none;")
-
-        text_lbl = QLabel(label)
-        text_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        text_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
-        text_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
-
-        layout.addWidget(icon_lbl)
-        layout.addWidget(text_lbl)
 
 
 # ─── STATUS BAR WIDGET ─────────────────────────────────────────────────────────
@@ -268,12 +406,10 @@ class StatusBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 0, 20, 0)
 
-        # Logo
         logo = QLabel("◈ RAAM")
         logo.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         logo.setStyleSheet(f"color: {COLORS['accent_amber']}; letter-spacing: 4px;")
 
-        # Status indicators
         self.status_label = QLabel("● ACTIVE")
         self.status_label.setFont(QFont("Segoe UI", 9))
         self.status_label.setStyleSheet(f"color: {COLORS['accent_teal']};")
@@ -371,6 +507,10 @@ class RAAMDashboard(QMainWindow):
         self.tts_enabled = True
         self.is_speaking = False
 
+        # Recording state
+        self._recorder: AudioRecorderThread | None = None
+        self._is_recording = False
+
         if GROQ_AVAILABLE and self.api_key:
             try:
                 self.client = Groq(api_key=self.api_key)
@@ -413,25 +553,20 @@ class RAAMDashboard(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Status Bar
         self.status_bar = StatusBar()
         root.addWidget(self.status_bar)
 
-        # Main Content
         content = QWidget()
         content_layout = QHBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
 
-        # ── LEFT SIDEBAR ──
         sidebar = self._build_sidebar()
         content_layout.addWidget(sidebar)
 
-        # ── MAIN CHAT AREA ──
         chat_area = self._build_chat_area()
         content_layout.addWidget(chat_area, stretch=1)
 
-        # ── RIGHT PANEL ──
         right_panel = self._build_right_panel()
         content_layout.addWidget(right_panel)
 
@@ -449,7 +584,6 @@ class RAAMDashboard(QMainWindow):
         layout.setContentsMargins(16, 20, 16, 20)
         layout.setSpacing(12)
 
-        # Pulse + RAAM status
         pulse_row = QHBoxLayout()
         self.pulse = PulseWidget(COLORS['accent_teal'])
         pulse_label = QLabel("RAAM\nActive")
@@ -462,7 +596,6 @@ class RAAMDashboard(QMainWindow):
 
         layout.addWidget(self._divider())
 
-        # Emergency Scenarios
         scenarios_label = QLabel("QUICK SCENARIOS")
         scenarios_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         scenarios_label.setStyleSheet(f"color: {COLORS['text_muted']}; letter-spacing: 2px;")
@@ -583,7 +716,21 @@ class RAAMDashboard(QMainWindow):
         h_layout.addWidget(self.thinking_label)
         h_layout.addStretch()
 
-        # API status
+        # Whisper badge
+        whisper_badge = QLabel("🎙 Whisper v3 Turbo")
+        whisper_badge.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        whisper_available = AUDIO_AVAILABLE and bool(self.client)
+        whisper_badge.setStyleSheet(f"""
+            color: {COLORS['accent_mic'] if whisper_available else COLORS['text_muted']};
+            background: {'rgba(180,79,255,0.1)' if whisper_available else 'rgba(255,255,255,0.03)'};
+            border: 1px solid {'rgba(180,79,255,0.3)' if whisper_available else COLORS['border']};
+            border-radius: 4px;
+            padding: 2px 8px;
+            letter-spacing: 1px;
+        """)
+        h_layout.addWidget(whisper_badge)
+        h_layout.addSpacing(10)
+
         api_status_text = "✓ Groq Connected" if (self.client and self.api_key) else "⚠ No API Key"
         api_status_color = COLORS['accent_teal'] if (self.client and self.api_key) else COLORS['accent_amber']
         api_status = QLabel(api_status_text)
@@ -593,7 +740,7 @@ class RAAMDashboard(QMainWindow):
 
         layout.addWidget(header)
 
-        # Scroll area for messages
+        # Scroll area
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -609,7 +756,6 @@ class RAAMDashboard(QMainWindow):
         self.scroll_area.setWidget(self.messages_widget)
         layout.addWidget(self.scroll_area, stretch=1)
 
-        # Input area
         input_area = self._build_input_area()
         layout.addWidget(input_area)
 
@@ -625,10 +771,21 @@ class RAAMDashboard(QMainWindow):
 
         layout = QHBoxLayout(area)
         layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
+
+        # Mic button
+        self.mic_btn = MicButton()
+        self.mic_btn.setToolTip("Hold to record voice (Whisper v3 Turbo)")
+        self.mic_btn.clicked.connect(self._toggle_recording)
+        if not (AUDIO_AVAILABLE and self.client):
+            self.mic_btn.setEnabled(False)
+            self.mic_btn.setToolTip(
+                "Install sounddevice + numpy and provide GROQ_API_KEY to enable voice input"
+            )
+        layout.addWidget(self.mic_btn)
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Describe your situation... RAAM is here to help")
+        self.input_field.setPlaceholderText("Describe your situation… or tap 🎙 to speak")
         self.input_field.setFont(QFont("Segoe UI", 12))
         self.input_field.setFixedHeight(46)
         self.input_field.returnPressed.connect(self._send_message)
@@ -690,7 +847,6 @@ class RAAMDashboard(QMainWindow):
         layout.setContentsMargins(16, 20, 16, 20)
         layout.setSpacing(14)
 
-        # Emergency contacts
         ec_label = QLabel("EMERGENCY CONTACTS")
         ec_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         ec_label.setStyleSheet(f"color: {COLORS['text_muted']}; letter-spacing: 2px;")
@@ -705,12 +861,10 @@ class RAAMDashboard(QMainWindow):
         ]
 
         for icon, name, number in contacts:
-            contact_widget = self._contact_card(icon, name, number)
-            layout.addWidget(contact_widget)
+            layout.addWidget(self._contact_card(icon, name, number))
 
         layout.addWidget(self._divider())
 
-        # Safety tips
         tips_label = QLabel("SAFETY REMINDERS")
         tips_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         tips_label.setStyleSheet(f"color: {COLORS['text_muted']}; letter-spacing: 2px;")
@@ -733,7 +887,6 @@ class RAAMDashboard(QMainWindow):
 
         layout.addStretch()
 
-        # Big SOS button
         sos_btn = QPushButton("🆘  SOS EMERGENCY")
         sos_btn.setFixedHeight(52)
         sos_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -794,10 +947,79 @@ class RAAMDashboard(QMainWindow):
         line.setStyleSheet(f"color: {COLORS['border']}; background: {COLORS['border']}; border: none; max-height: 1px;")
         return line
 
+    # ─── VOICE INPUT ──────────────────────────────────────────────────────────
+    def _toggle_recording(self):
+        if not self._is_recording:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self):
+        if not AUDIO_AVAILABLE:
+            self.thinking_label.setText("⚠ Install sounddevice + numpy for voice input")
+            return
+        if not self.client:
+            self.thinking_label.setText("⚠ Groq API key required for voice input")
+            return
+
+        self._is_recording = True
+        self.mic_btn.set_recording(True)
+        self.thinking_label.setText("🎙 Recording… tap ⏹ to stop")
+        self.status_bar.set_status("RECORDING", COLORS['accent_mic'])
+        self.pulse.set_color(COLORS['accent_mic'])
+        self.send_btn.setEnabled(False)
+        self.input_field.setEnabled(False)
+
+        self._recorder = AudioRecorderThread()
+        self._recorder.finished.connect(self._on_audio_recorded)
+        self._recorder.error_occurred.connect(self._on_audio_error)
+        self._recorder.start()
+
+    def _stop_recording(self):
+        self._is_recording = False
+        self.mic_btn.set_recording(False)
+        self.thinking_label.setText("⏳ Transcribing with Whisper v3 Turbo…")
+        self.status_bar.set_status("TRANSCRIBING", COLORS['accent_amber'])
+
+        if self._recorder:
+            self._recorder.stop()
+
+    def _on_audio_recorded(self, wav_path: str):
+        """Audio file saved — send to Whisper."""
+        if not self.client:
+            self._on_audio_error("No Groq client available.")
+            return
+
+        self._whisper_thread = WhisperThread(self.client, wav_path)
+        self._whisper_thread.transcribed.connect(self._on_transcription)
+        self._whisper_thread.error_occurred.connect(self._on_audio_error)
+        self._whisper_thread.start()
+
+    def _on_transcription(self, text: str):
+        """Whisper returned text — populate input and send."""
+        self.pulse.set_color(COLORS['accent_teal'])
+        self.thinking_label.setText("")
+        self.input_field.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.status_bar.set_status("ACTIVE", COLORS['accent_teal'])
+
+        self.input_field.setText(text)
+        # Auto-send transcribed message
+        self._send_message()
+
+    def _on_audio_error(self, error: str):
+        self._is_recording = False
+        self.mic_btn.set_recording(False)
+        self.pulse.set_color(COLORS['accent_teal'])
+        self.thinking_label.setText(f"⚠ {error}")
+        self.status_bar.set_status("ACTIVE", COLORS['accent_teal'])
+        self.input_field.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        QTimer.singleShot(4000, lambda: self.thinking_label.setText(""))
+
     # ─── MESSAGE HANDLING ──────────────────────────────────────────────────────
     def _add_message(self, text, is_user=False):
         bubble = ChatBubble(text, is_user)
-        # Insert before the stretch at the end
         count = self.messages_layout.count()
         self.messages_layout.insertWidget(count - 1, bubble)
         QTimer.singleShot(50, self._scroll_to_bottom)
@@ -807,7 +1029,7 @@ class RAAMDashboard(QMainWindow):
         sb.setValue(sb.maximum())
 
     def _send_welcome(self):
-        welcome = "Hello! I'm RAAM, your Road Assistance & Alert Monitor. I'm here with you, calm and ready to help. Whether it's a breakdown, an accident, or just a stressful drive — tell me what's happening and we'll handle it together. 🧡"
+        welcome = "Hello! I'm RAAM, your Road Assistance & Alert Monitor. I'm here with you, calm and ready to help. Whether it's a breakdown, an accident, or just a stressful drive — tell me what's happening and we'll handle it together. You can type or tap the 🎙 mic button to speak. 🧡"
         self._add_message(welcome, is_user=False)
         if self.tts_enabled:
             self._speak(welcome)
@@ -827,7 +1049,8 @@ class RAAMDashboard(QMainWindow):
 
         self.send_btn.setEnabled(False)
         self.input_field.setEnabled(False)
-        self.thinking_label.setText("RAAM is thinking...")
+        self.mic_btn.setEnabled(False)
+        self.thinking_label.setText("RAAM is thinking…")
         self.status_bar.set_status("THINKING", COLORS['accent_amber'])
 
         if self.client:
@@ -840,7 +1063,6 @@ class RAAMDashboard(QMainWindow):
             self.groq_thread.error_occurred.connect(self._on_error)
             self.groq_thread.start()
         else:
-            # Demo fallback
             demo_response = "I hear you, and I want you to know — you're not alone right now. Please make sure you're in a safe location. If this is a life-threatening emergency, please call 911 immediately. I'm here to guide you through this step by step. Can you tell me more about what's happening?"
             self._add_message(demo_response, is_user=False)
             self._finish_response(demo_response)
@@ -852,7 +1074,6 @@ class RAAMDashboard(QMainWindow):
             count = self.messages_layout.count()
             self.messages_layout.insertWidget(count - 1, self._response_bubble)
         else:
-            # Update the label text
             label = self._response_bubble.findChild(QLabel)
             if label:
                 label.setText(self._current_response)
@@ -870,6 +1091,8 @@ class RAAMDashboard(QMainWindow):
     def _finish_response(self, text):
         self.send_btn.setEnabled(True)
         self.input_field.setEnabled(True)
+        if AUDIO_AVAILABLE and self.client:
+            self.mic_btn.setEnabled(True)
         self.thinking_label.setText("")
         self.status_bar.set_status("ACTIVE", COLORS['accent_teal'])
 
@@ -887,13 +1110,9 @@ class RAAMDashboard(QMainWindow):
 
     def _toggle_tts(self, checked):
         self.tts_enabled = checked
-        if checked:
-            self.tts_btn.setText("🔊  Voice Response ON")
-        else:
-            self.tts_btn.setText("🔇  Voice Response OFF")
+        self.tts_btn.setText("🔊  Voice Response ON" if checked else "🔇  Voice Response OFF")
 
     def _clear_chat(self):
-        # Remove all bubbles (except the stretch)
         while self.messages_layout.count() > 1:
             item = self.messages_layout.takeAt(0)
             if item.widget():
@@ -905,16 +1124,13 @@ class RAAMDashboard(QMainWindow):
 # ─── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
     if not os.path.exists(".env"):
-        # Create sample .env if not exists
         with open(".env", "w") as f:
             f.write("# Add your Groq API key here\nGROQ_API_KEY=your_groq_api_key_here\n")
         print("Created .env file — please add your GROQ_API_KEY")
 
     app = QApplication(sys.argv)
     app.setApplicationName("RAAM")
-    app.setApplicationVersion("1.0")
-
-    # High DPI
+    app.setApplicationVersion("1.1")
     app.setStyle("Fusion")
 
     window = RAAMDashboard()
