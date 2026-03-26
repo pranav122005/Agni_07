@@ -1,0 +1,43 @@
+BUCK CONVERTER (12V → 3.3V)
+text
+Buck OUT+ (3.3V) ───→ Breadboard 
+Buck OUT- (GND) ────→ Breadboard 
+
+ESP32  3V3
+ESP32  GND
+LoRa RA-02 → ESP32 (Main Side)
+text
+┌─────────────────┬──────────────┐
+│ LoRa Pin        │ Connection   │
+├─────────────────┼──────────────┤
+│ VCC             │ + rail (3.3V)│
+│ GND             │ - rail (GND) │
+│ NSS/CS          │ **D6** (GPIO12) │
+│ SCK             │ **SD1** (GPIO18)│
+│ MISO            │ **SD2** (GPIO19)│
+│ MOSI            │ **D4** (GPIO2) │
+│ DIO0            │ **D2** (GPIO4) │
+│ RST             │ **D5** (GPIO14)│
+└─────────────────┴──────────────┘
+ MicroSD → ESP32 (Main Side)
+text
+┌──────────────┬──────────────┐
+│ SD Pin       │ Connection   │
+├──────────────┼──────────────┤
+│ VCC          │ + rail (3.3V)│
+│ GND          │ - rail (GND) │
+│ CS           │ **D1** (GPIO5) │
+│ SCK          │ **SD1** (GPIO18)│ ✓ SHARED
+│ MISO         │ **SD2** (GPIO19)│ ✓ SHARED
+│ MOSI         │ **D4** (GPIO2) │ ✓ SHARED
+└──────────────┴──────────────┘
+OLED → ESP32 (OTHER SIDE)
+text
+┌──────────────┬──────────────┐
+│ OLED Pin     │ Connection   │
+├──────────────┼──────────────┤
+│ VCC          │ + rail (3.3V)│ Jumper from main
+│ GND          │ - rail (GND) │ Jumper from main
+│ **SDA**      │ **SD0** (GPIO16) │
+│ **SCL**      │ **CMD** (GPIO17)│
+└──────────────┴──────────────┘
