@@ -1,0 +1,127 @@
+#include <ESP8266WiFi.h>
+extern "C" {
+  #include <espnow.h>
+}
+
+// ============================================================
+//  🔴 ONLY CHANGE THIS PER NODE:  A=1, B=2, C=3
+// ============================================================
+#define MY_ID 3
+// ============================================================
+
+// 🔴 Fill in all three MACs from your actual hardware
+uint8_t macA[] = {0x48, 0x3F, 0xDA, 0x57, 0x00, 0xCC};  // Node A
+uint8_t macB[] = {0x50, 0x02, 0x91, 0xFB, 0xFA, 0xFC};  // Node B
+uint8_t macC[] = {0x50, 0x02, 0x91, 0xE9, 0x0E, 0x53}; //Node C — replace!
+
+// Peer table: index 0=A, 1=B, 2=C
+uint8_t* peers[3] = {macA, macB, macC};
+
+// ── Message structure ────────────────────────────────────────
+typedef struct struct_message {
+  uint8_t  senderID;   // original sender (1/2/3)
+  uint8_t  relayID;    // who is forwarding right now
+  uint16_t msgID;      // unique per sender
+  char     text[200];
+} struct_message;
+
+// ── Duplicate detection (circular buffer of 20 seen IDs) ────
+struct SeenKey { uint8_t sender; uint16_t msgID; };
+SeenKey seenBuf[20];
+int seenIdx = 0;
+
+bool isDuplicate(uint8_t sender, uint16_t id) {
+  for (int i = 0; i < 20; i++)
+    if (seenBuf[i].sender == sender && seenBuf[i].msgID == id)
+      return true;
+  return false;
+}
+
+void markSeen(uint8_t sender, uint16_t id) {
+  seenBuf[seenIdx] = {sender, id};
+  seenIdx = (seenIdx + 1) % 20;
+}
+
+// ── Send helper: relay to everyone except self & skip-peer ──
+void relayTo(struct_message &m, uint8_t skipID) {
+  m.relayID = MY_ID;
+  for (int i = 0; i < 3; i++) {
+    uint8_t peerID = i + 1;            // peers[] is 0-indexed, IDs are 1-based
+    if (peerID == MY_ID)  continue;    // never send to self
+    if (peerID == skipID) continue;    // don't echo back to sender
+    esp_now_send(peers[i], (uint8_t*)&m, sizeof(m));
+  }
+}
+
+// ── Receive callback ─────────────────────────────────────────
+void onReceive(uint8_t *mac, uint8_t *data, uint8_t len) {
+  struct_message incoming;
+  memcpy(&incoming, data, sizeof(incoming));
+
+  // Ignore our own messages bouncing back
+  if (incoming.senderID == MY_ID) return;
+
+  // Drop duplicates
+  if (isDuplicate(incoming.senderID, incoming.msgID)) return;
+  markSeen(incoming.senderID, incoming.msgID);
+
+  Serial.print("📩 [Node ");
+  Serial.print((char)('A' + incoming.senderID - 1));
+  Serial.print("] ");
+  Serial.println(incoming.text);
+
+  // Relay to remaining peers (skip whoever sent it to us = relayID)
+  relayTo(incoming, incoming.relayID);
+}
+
+// ── Setup ────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  memset(seenBuf, 0, sizeof(seenBuf));
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != 0) {
+    Serial.println("❌ ESP-NOW Init Failed — halting");
+    while (true) delay(1000);
+  }
+
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_recv_cb(onReceive);
+
+  // Register all peers except self
+  for (int i = 0; i < 3; i++) {
+    if ((i + 1) == MY_ID) continue;
+    esp_now_add_peer(peers[i], ESP_NOW_ROLE_COMBO, 1, NULL, 0);
+  }
+
+  Serial.print("🚀 Node ");
+  Serial.print((char)('A' + MY_ID - 1));
+  Serial.println(" ready. Type a message and press ENTER:");
+}
+
+// ── Loop ─────────────────────────────────────────────────────
+void loop() {
+  static uint16_t msgCounter = 0;
+
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) return;
+
+    struct_message msg;
+    msg.senderID = MY_ID;
+    msg.relayID  = MY_ID;
+    msg.msgID    = ++msgCounter;
+    input.toCharArray(msg.text, sizeof(msg.text));
+
+    // Mark own message as seen so we ignore any echo
+    markSeen(MY_ID, msg.msgID);
+
+    relayTo(msg, MY_ID);   // send to all others
+
+    Serial.print("📤 Sent: ");
+    Serial.println(msg.text);
+  }
+}
